@@ -33,7 +33,7 @@ EVENT_LABEL = "WUCC 2026"
 
 # ADAPT: short display names keyed by the exact "Player" value in the export.
 # Anyone not listed is shown by first name, duplicates get their jersey number.
-NICKNAMES = {"12 Anika Gnaedinger": "Ani"}
+NICKNAMES = {"12 Anika Gnaedinger": "Ani", "54 Thanh Elsener": "Trissy"}
 
 # ADAPT: scoring conventions and thresholds
 A2_WEIGHT = 0.0         # credit for a hockey assist in +/-: 0 (common), 0.5 (fantasy-style) or 1
@@ -56,6 +56,8 @@ MATCHING = {
     "54 Thanh Elsener": "FMP",
 }
 TOP_TARGETS = 3   # how many favourite targets / throwers to list per player
+# ADAPT: order of the sections on the page
+SECTION_ORDER = ["games", "sheet", "playing", "throwing", "connections", "receiving", "scoring", "points_won"]
 
 # ADAPT: actual schedule, keyed by opponent as named in the Games export. Overrides the
 # dates and times Statto recorded (which are when the game was tagged, not played) and
@@ -239,14 +241,19 @@ def diverging_bars(rows, *, pos=SPLASH, neg=MIST, value_fmt="{:+.1f}", label_w=1
     return "\n".join(out)
 
 
-def stacked_bars(rows, *, colors=(SPLASH, AMBER), label_w=118, bar_w=300, row_h=22) -> str:
-    """rows = [(label, [v1, v2])]"""
+def stacked_bars(rows, *, colors=(SPLASH, AMBER), label_w=118, bar_w=300, row_h=22, marker=None) -> str:
+    """rows = [(label, [v1, v2])]; marker = (value, label) draws a dashed vertical reference line."""
     vmax = max(sum(v) for _, v in rows) or 1
-    h = row_h * len(rows)
+    top = 18 if marker else 0
+    h = row_h * len(rows) + top
     w = label_w + bar_w + 60
     out = [f'<svg viewBox="0 0 {w} {h}" width="100%" role="img" font-family="inherit" font-size="13">']
+    if marker:
+        mx = label_w + marker[0] / vmax * bar_w
+        out.append(f'<line x1="{mx:.1f}" x2="{mx:.1f}" y1="{top}" y2="{h}" stroke="{INK}" stroke-width="1" stroke-dasharray="4 3"/>')
+        out.append(f'<text x="{mx:.1f}" y="12" text-anchor="middle" fill="{INK}" font-size="12">{esc(marker[1])}</text>')
     for i, (label, vals) in enumerate(rows):
-        y = i * row_h
+        y = i * row_h + top
         x = label_w
         out.append(f'<text x="{label_w - 8}" y="{y + 15}" text-anchor="end" fill="{INK}">{esc(label)}</text>')
         for v, c in zip(vals, colors):
@@ -287,24 +294,25 @@ def games_table(g: pd.DataFrame) -> str:
             "<th>Turns</th><th>Blocks</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
 
 
-def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single_game: bool) -> str:
+def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single_game: bool, prefix: str) -> str:
     """One complete set of sections for a player frame, a games frame and a pass log."""
     full = "pts" in p.columns      # playing time, blocks, points won available
     has_passes = len(passes) > 0
     clean = g[~g["suspect"]]
-    parts = []
+    sec = {k: [] for k in SECTION_ORDER}
+    add = lambda k, h: sec[k].append(h)
 
     # -- games
     team_line = (f"{'This game' if single_game else f'Over the {len(clean)} games'}: {int(clean.holds.sum())} holds, "
                  f"{int(clean.breaks.sum())} breaks, {int(clean.turns.sum())} turnovers, {int(clean.blocks.sum())} blocks.")
-    parts.append(f"""
+    add("games", f"""
 <h2>{'Game' if single_game else 'Games'}</h2>
 <p class="muted">Holds are points we started on offence and won, breaks are points we started on defence and won.{' Greyed rows were only partly recorded.' if SUSPECT_GAMES and not single_game else ''}</p>
 {games_table(g)}
 <p class="muted">{esc(team_line)}</p>""")
 
     if not full:
-        parts.append(f"""
+        add("games", f"""
 <p class="muted">Per-game numbers below come from the pass log. Points played, blocks, points won and +/- need the per-game Players export from Statto, which isn't included yet.</p>""")
 
     # -- scoring
@@ -315,7 +323,7 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
                          color=color, note_fmt="({:.1f} per 10 pts)")
         return hbars([(r.short, r[col], None) for _, r in d.iterrows()], color=color)
 
-    parts.append(f"""
+    add("scoring", f"""
 <h2>Scoring</h2>
 <p class="muted">Raw counts for everyone with at least one{', with the rate per 10 points played in grey so heavy playing time does not dominate' if full else ''}.</p>
 <h3>Goals</h3>
@@ -329,7 +337,7 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         pm_rows = [(r.short, r.plus_minus,
                     f"({r.goals:g}G {r.assists:g}A {r.blocks:g}B − {r.turnovers:g}T" + (f" + {A2_WEIGHT:g}×{r.a2:g}A2)" if A2_WEIGHT else ")"))
                    for _, r in pm.iterrows()]
-        parts.append(f"""
+        add("scoring", f"""
 <h3>Blocks</h3>
 {ranked('blocks', AMBER)}
 <h3>Plus/minus</h3>
@@ -340,7 +348,7 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
     thr = p[p["throws"] > 0].sort_values("gain_per_throw", ascending=False)
     gain_svg = hbars([(r.short, r.gain_per_throw, f"{r.throws:g} throws, {r.completion:.0%}") for _, r in thr.iterrows()],
                      value_fmt="{:.1f} m", note_fmt="({})")
-    parts.append(f"""
+    add("throwing", f"""
 <h2>Throwing</h2>
 <p>Not every throw is equal, so completion percentage alone is misleading: a reset handler at 97% and a cutter throwing hucks at 85% aren't doing the same job. The lists below split throwing into how much field each completed throw gains and how hard the throws were. Everyone is included, so treat the numbers for players with few throws as anecdotes.</p>
 <h3>Metres gained per completed throw</h3>
@@ -356,7 +364,7 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         ce["coe"] = ce.comp - ce.exp
         ce = ce.sort_values("coe", ascending=False)
         coe_svg = diverging_bars([(t, r.coe, f"({int(r.comp)}/{int(r.n)}, expected {r.exp:.1f})") for t, r in ce.iterrows()])
-        parts.append(f"""
+        add("throwing", f"""
 <h3>Completions over expected</h3>
 <p class="muted">Each throw is compared with the team completion rate over the whole event for throws of the same forward distance, and the differences are summed per player. Positive means completing harder throws than a typical teammate would. It adjusts for distance, not for situation, so D-line throwers after a block are held to the same bar as the O-line.</p>
 {coe_svg}""")
@@ -392,7 +400,8 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
                 cells.append(f'<td style="background:rgba(24,119,210,{0.08 + 0.72 * v / vmax:.2f})" title="{esc(tip)}">{v}{sup}</td>')
             rows.append(f'<tr><th>{esc(t)}</th>{"".join(cells)}<td class="tot">{int(mat.loc[t].sum())}</td></tr>')
         matrix = (f'<div class="scroll"><table class="matrix"><thead><tr>{head}<th>Total</th></tr></thead>'
-                  f'<tbody>{"".join(rows)}</tbody></table></div>')
+                  f'<tbody>{"".join(rows)}</tbody></table></div>'
+                  '<p class="muted matrix-note">Tap a cell to see the split.</p>')
 
         # favourite targets and throwers per player
         tgt = pl.groupby(["t", "r"]).size().reset_index(name="n")
@@ -411,11 +420,13 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         unmapped = sorted(set(pl.loc[mm.tm.isna(), "Thrower"]) | set(pl.loc[mm.rm.isna(), "Receiver"]))
         mm = mm.dropna(subset=["tm", "rm"])
         combo = mm.groupby(["tm", "rm"]).agg(n=("completed", "size"), comp=("completed", "mean"), fwd=("fwd", "mean"))
+        combo["fwd_c"] = mm[mm["completed"] == 1].groupby(["tm", "rm"])["fwd"].mean()
         combo_rows = "".join(
-            f"<tr><td>{a} → {b}</td><td>{int(r_.n)}</td><td>{r_.n / len(mm):.0%}</td><td>{r_.comp:.0%}</td><td>{r_.fwd:+.1f}</td></tr>"
+            f"<tr><td>{a} → {b}</td><td>{int(r_.n)}</td><td>{r_.n / len(mm):.0%}</td><td>{r_.comp:.0%}</td>"
+            f"<td>{r_.fwd:+.1f}</td><td>{r_.fwd_c:+.1f}</td></tr>"
             for (a, b), r_ in combo.reindex([("MMP", "MMP"), ("MMP", "FMP"), ("FMP", "MMP"), ("FMP", "FMP")]).dropna().iterrows())
         combo_table = ('<table><thead><tr><th>Thrower → receiver</th><th>Throws</th><th>Share</th><th>Completed</th>'
-                       f'<th>Avg forward m</th></tr></thead><tbody>{combo_rows}</tbody></table>')
+                       f'<th>Fwd m attempted</th><th>Fwd m completed</th></tr></thead><tbody>{combo_rows}</tbody></table>')
         per_m = mm.groupby(["t", "rm"]).size().unstack(fill_value=0).reindex(columns=["MMP", "FMP"], fill_value=0)
         per_m["tot"] = per_m.sum(axis=1)
         per_m = per_m.sort_values("tot", ascending=False)
@@ -424,9 +435,12 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
 
         kinds = ["long", "upfield", "swing", "dump"]
         tk = pl.groupby("kind").agg(n=("completed", "size"), comp=("completed", "sum"), fwd=("fwd", "mean")).reindex(kinds)
-        tk_rows = "".join(f"<tr><td>{k.capitalize()}</td><td>{int(r.n)}</td><td>{r.comp / r.n:.0%}</td><td>{r.fwd:+.1f}</td></tr>"
+        tk["fwd_c"] = pl[pl["completed"] == 1].groupby("kind")["fwd"].mean()
+        tk_rows = "".join(f"<tr><td>{k.capitalize()}</td><td>{int(r.n)}</td><td>{r.comp / r.n:.0%}</td>"
+                          f"<td>{r.fwd:+.1f}</td><td>{r.fwd_c:+.1f}</td></tr>"
                           for k, r in tk.iterrows() if r.n > 0)
-        team_kind_table = ('<table><thead><tr><th>Throw type</th><th>Throws</th><th>Completed</th><th>Avg forward m</th></tr></thead>'
+        team_kind_table = ('<table><thead><tr><th>Throw type</th><th>Throws</th><th>Completed</th>'
+                           '<th>Fwd m attempted</th><th>Fwd m completed</th></tr></thead>'
                            f'<tbody>{tk_rows}</tbody></table>')
         per = pl.groupby(["t", "kind"]).agg(n=("completed", "size"), comp=("completed", "sum"))
         pk_rows = []
@@ -443,31 +457,31 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
                           + "".join(f"<th>{k.capitalize()}</th>" for k in kinds)
                           + f'<th>All</th></tr></thead><tbody>{"".join(pk_rows)}</tbody></table></div>')
 
-        parts.append(f"""
+        add("connections", f"""
 <h2>Who throws to whom</h2>
 <h3>Most common connections</h3>
 <p class="muted">All attempts between a thrower and receiver, completions in grey.</p>
 {pairs_svg}
 <h3>Pass attempts, thrower by receiver</h3>
-<p class="muted">Rows throw, columns catch, everyone included, ordered by touches. The small amber number is how many of those attempts were turnovers. Statto logs whether each was a throwaway or a drop, and tapping a cell shows the split. Scroll sideways on a phone.</p>
+<p class="muted">Rows throw, columns catch, everyone included, ordered by touches. The small amber number is how many of those attempts were turnovers. Statto logs whether each was a throwaway or a drop, and tapping a cell shows the split below the table. Scroll sideways on a phone.</p>
 {matrix}
 <h3>Favourite targets</h3>
 <p class="muted">Each player's top {TOP_TARGETS} receivers and top {TOP_TARGETS} throwers, by attempts.</p>
 {fav_table}
 <h3>MMP and FMP throwing</h3>
-<p class="muted">Where the disc goes between matching groups. Share is the fraction of all logged throws.{unmapped_note}</p>
+<p class="muted">Where the disc goes between matching groups. Share is the fraction of all logged throws. Forward metres are shown twice: averaged over every attempt, which measures how ambitious the throws were, and over completions only, which is the ground actually gained. Turnovers are on average much longer throws than completions, so the two differ.{unmapped_note}</p>
 {combo_table}
 <p class="legend">Throws per player, most first<i style="background:{SPLASH}"></i>to MMP<i style="background:{AMBER}"></i>to FMP</p>
 {split_svg}
 <h3>Completion by throw type</h3>
-<p class="muted">Long is any throw gaining {LONG_THROW_M} m or more, swing and dump are Statto's flags, and upfield is everything else. This is the fair way to compare throwers: a dump and a long throw are different jobs. Positive forward metres mean the disc moved toward the attacking end zone.</p>
+<p class="muted">Categories from the tapped positions. Dump is any pass that goes backwards, however far sideways. Swing is a pass that moves the disc at least 11 m across the field while staying within about 8 m forward or back. Long is any throw gaining {LONG_THROW_M} m or more. Upfield is everything else, from a short give-and-go up to just under {LONG_THROW_M} m. Splitting throws this way makes throwers comparable, since a dump and a long throw are different jobs. Forward metres are positive when the disc moves toward the end zone we are attacking, shown once averaged over every attempt and once over completions only.</p>
 {team_kind_table}
 <p class="muted">Per player, completed/attempted.</p>
 {per_kind_table}""")
 
     # -- receiving
     rc = p[p["catches"] > 0].sort_values("gain_per_catch", ascending=False)
-    parts.append(f"""
+    add("receiving", f"""
 <h2>Receiving</h2>
 <p class="muted">Average field gained on each catch. High numbers are the deep cutters.</p>
 {hbars([(r.short, r.gain_per_catch, r.catches) for _, r in rc.iterrows()], value_fmt="{:.1f} m", note_fmt="({:g} catches)")}""")
@@ -475,12 +489,15 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
     # -- playing time and points won
     if full:
         pt = p.sort_values("pts", ascending=False)
+        median_pts = float(p["pts"].median())
         wp = p[p["pts"] > 0].sort_values("win_pct", ascending=False)
-        parts.append(f"""
+        add("playing", f"""
 <h2>Playing time</h2>
-<p class="legend">Points played, most first<i style="background:{SPLASH}"></i>offence<i style="background:{AMBER}"></i>defence</p>
-{stacked_bars([(r.short, [r.o_pts, r.d_pts]) for _, r in pt.iterrows()])}
+<p class="legend">Points played, most first, dashed line at the squad median<i style="background:{SPLASH}"></i>offence<i style="background:{AMBER}"></i>defence</p>
+{stacked_bars([(r.short, [r.o_pts, r.d_pts]) for _, r in pt.iterrows()], marker=(median_pts, f"median {median_pts:g}"))}
 
+""")
+        add("points_won", f"""
 <h2>Points won while on the field</h2>
 <p class="muted">Share of points we scored with this player on the line. Mostly reflects which line you play on and who you play with, so treat it as a curiosity rather than a rating.</p>
 {hbars([(r.short, r.win_pct * 100, f"{r.won:g}/{r.pts:g}") for _, r in wp.iterrows()], value_fmt="{:.0f}%", note_fmt="{}", max_value=100)}""")
@@ -499,13 +516,23 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
                    for _, r in sheet.iterrows())
     tot = {c: p[c].sum() for _, c in cols[1:] if c not in ("plus_minus", "pts")}
     tot_line = ", ".join(f"{tot[c]:g} {h if h == 'A2' else h.lower()}" for h, c in cols[1:] if c in tot)
-    parts.append(f"""
+    add("sheet", f"""
 <h2>Full stat sheet</h2>
 <p class="muted">Every player. Tap a column heading to sort by it. A2 is the hockey assist, the pass before the assist. Turnovers are throwaways plus drops.{' +/- is goals + assists + blocks − turnovers' + a2_note() + '.' if full else ''} Sorted by goals + assists + hockey assists.</p>
 <div class="scroll"><table class="sheet"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>
 <p class="muted">Team totals: {tot_line}.</p>""")
 
-    return "\n".join(parts)
+    body = "\n".join(h for k in SECTION_ORDER for h in sec[k])
+    # anchor every section heading and build the contents list
+    titles = []
+    def anchor(m):
+        title = m.group(1)
+        slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+        titles.append((title, f"{prefix}-{slug}"))
+        return f'<h2 id="{prefix}-{slug}">{title}</h2>'
+    body = re.sub(r"<h2>([^<]*)</h2>", anchor, body)
+    toc = '<nav class="toc">' + "".join(f'<a href="#{i}">{esc(t)}</a>' for t, i in titles) + "</nav>"
+    return toc + body
 
 
 CSS = f"""
@@ -516,7 +543,7 @@ body {{ margin:0; background:#fff; color:var(--ink); font-family:"Barlow","Helve
 main {{ max-width:680px; margin:0 auto; padding:20px 18px 56px; }}
 h1 {{ font-size:34px; font-weight:600; letter-spacing:-0.01em; margin:0; line-height:1.1; }}
 h1 small {{ display:block; font-size:16px; font-weight:400; color:var(--mist); margin-top:4px; }}
-h2 {{ font-size:22px; font-weight:600; margin:44px 0 4px; }}
+h2 {{ font-size:22px; font-weight:600; margin:44px 0 4px; scroll-margin-top:64px; }}
 h3 {{ font-size:16px; font-weight:600; margin:26px 0 6px; }}
 p {{ margin:6px 0 14px; max-width:60ch; }}
 .muted {{ color:var(--mist); font-size:14px; }}
@@ -533,11 +560,18 @@ p {{ margin:6px 0 14px; max-width:60ch; }}
 .record div b {{ display:block; font-size:28px; font-weight:600; line-height:1.1; color:var(--ink); }}
 .tabs {{ position:sticky; top:0; z-index:2; background:rgba(255,255,255,0.96); margin:22px -18px 0; padding:8px 18px; border-bottom:1px solid var(--rule); overflow-x:auto; white-space:nowrap; scrollbar-width:none; }}
 .tabs::-webkit-scrollbar {{ display:none; }}
-.tabs button {{ font:inherit; font-size:14px; color:var(--ink); background:none; border:1px solid var(--rule); border-radius:999px; padding:5px 12px; margin-right:6px; cursor:pointer; }}
+.tabs button {{ font:inherit; font-size:14px; color:var(--ink); background:none; border:1px solid var(--rule); border-radius:999px; padding:5px 12px; margin:0 6px 0 0; cursor:pointer; }}
+@media (min-width: 600px) {{
+  .tabs {{ white-space:normal; overflow:visible; display:flex; flex-wrap:wrap; }}
+  .tabs button {{ margin:0 6px 6px 0; }}
+}}
 .tabs button.on {{ background:var(--ink); color:#fff; border-color:var(--ink); }}
 .view {{ display:none; }}
 .view.on {{ display:block; }}
-.view-title {{ font-size:14px; color:var(--mist); margin:18px 0 -30px; }}
+.view-title {{ font-size:14px; color:var(--mist); margin:18px 0 0; }}
+.toc {{ display:flex; flex-wrap:wrap; margin:14px 0 4px; }}
+.toc a {{ color:var(--ink); text-decoration:none; font-size:14px; padding:4px 10px; margin:0 6px 6px 0; background:var(--tint); border-radius:4px; }}
+.toc a:hover {{ background:#D3E6F8; }}
 table {{ width:100%; border-collapse:collapse; font-size:13px; margin:8px 0 12px; }}
 th, td {{ text-align:right; padding:5px 4px; border-bottom:1px solid var(--rule); white-space:nowrap; }}
 th:first-child, td:first-child {{ text-align:left; padding-left:0; }}
@@ -558,6 +592,9 @@ td .stage {{ display:block; font-size:11px; color:var(--mist); line-height:1.1; 
 .matrix tbody th {{ text-align:left; font-weight:500; color:var(--ink); padding-left:0; white-space:nowrap; }}
 .matrix td.tot {{ color:var(--mist); }}
 .matrix td sup {{ font-size:9px; color:var(--amber); font-weight:600; margin-left:1px; }}
+.matrix td[title] {{ cursor:pointer; }}
+.matrix td.picked {{ outline:2px solid var(--ink); outline-offset:-2px; }}
+.matrix-note {{ min-height:1.4em; margin-top:8px; }}
 .legend {{ font-size:13px; color:var(--mist); margin:0 0 6px; }}
 .legend i {{ display:inline-block; width:10px; height:10px; border-radius:2px; margin:0 5px 0 12px; vertical-align:-1px; }}
 svg text {{ font-family:inherit; }}
@@ -573,6 +610,15 @@ JS = """
       tabs.forEach(function (x) { x.classList.remove('on'); }); b.classList.add('on');
       views.forEach(function (v) { v.classList.toggle('on', v.dataset.view === b.dataset.view); });
       window.scrollTo(0, 0);
+    });
+  });
+  document.querySelectorAll('table.matrix').forEach(function (t) {
+    var note = t.parentNode.nextElementSibling;
+    t.addEventListener('click', function (e) {
+      var td = e.target.closest('td[title]'); if (!td) return;
+      t.querySelectorAll('td.picked').forEach(function (c) { c.classList.remove('picked'); });
+      td.classList.add('picked');
+      if (note) note.textContent = td.getAttribute('title');
     });
   });
   document.querySelectorAll('table.sheet').forEach(function (t) {
@@ -599,7 +645,7 @@ def build(p, g, passes, by_game) -> str:
     losses = len(g) - wins
     game_names = list(g["Opponent"])
 
-    views = [f'<section class="view on" data-view="all">{build_view(p, g, passes, single_game=False)}</section>']
+    views = [f'<section class="view on" data-view="all">{build_view(p, g, passes, single_game=False, prefix="all")}</section>']
     tabs = ['<button class="on" data-view="all">All games</button>']
     for i, opp in enumerate(game_names):
         gi = g[g["Opponent"] == opp]
@@ -612,7 +658,7 @@ def build(p, g, passes, by_game) -> str:
             continue
         r = gi.iloc[0]
         views.append(f'<section class="view" data-view="g{i}"><p class="view-title">vs {esc(opp)}, {r.us}–{r.them}</p>'
-                     f'{build_view(frame, gi, pi, single_game=True)}</section>')
+                     f'{build_view(frame, gi, pi, single_game=True, prefix=f"g{i}")}</section>')
         tabs.append(f'<button data-view="g{i}">{esc(opp)}</button>')
 
     return f"""<!doctype html>
