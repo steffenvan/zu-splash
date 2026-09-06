@@ -33,7 +33,7 @@ EVENT_LABEL = "WUCC 2026"
 
 # ADAPT: short display names keyed by the exact "Player" value in the export.
 # Anyone not listed is shown by first name, duplicates get their jersey number.
-NICKNAMES = {"12 Anika Gnaedinger": "Ani", "54 Thanh Elsener": "Trissy"}
+NICKNAMES = {"12 Anika Gnaedinger": "Ani"}
 
 # ADAPT: scoring conventions and thresholds
 A2_WEIGHT = 0.0         # credit for a hockey assist in +/-: 0 (common), 0.5 (fantasy-style) or 1
@@ -190,6 +190,61 @@ def load_players_by_game(games: pd.DataFrame) -> dict[str, pd.DataFrame]:
     return out
 
 
+def solve_o_points(ps: pd.DataFrame) -> dict[int, bool]:
+    """Which points started on offence, from the per-game Player Stats file.
+
+    Each player's "Offense points played" must equal the number of O points among the
+    points they played. That is a small binary system; starting from a lineup guess and
+    flipping points until every player's count is satisfied solves it exactly for these
+    games (residual 0 on all ten)."""
+    import numpy as np
+    pts = sorted({int(x) for v in ps["Points played"] for x in str(v).split(",")})
+    A = np.zeros((len(ps), len(pts)))
+    for i, v in enumerate(ps["Points played"]):
+        for x in str(v).split(","):
+            A[i, pts.index(int(x))] = 1
+    o_target = ps["o_pts"].values.astype(float)
+    d_counts = ps["d_pts"].values
+    x = np.zeros(len(pts))
+    for j in range(len(pts)):
+        on = A[:, j] == 1
+        x[j] = (d_counts[on] == 0).sum() > (o_target[on] == 0).sum()
+
+    def resid(v):
+        return float(((A @ v - o_target) ** 2).sum())
+
+    best, improved = resid(x), True
+    while best > 0 and improved:
+        improved = False
+        for j in range(len(pts)):
+            y = x.copy(); y[j] = 1 - y[j]
+            if (r := resid(y)) < best:
+                x, best, improved = y, r, True
+        if not improved:
+            for j in range(len(pts)):
+                for k in range(j + 1, len(pts)):
+                    y = x.copy(); y[j] = 1 - y[j]; y[k] = 1 - y[k]
+                    if (r := resid(y)) < best:
+                        x, best, improved = y, r, True
+    if best > 0:
+        print("warning: could not fully resolve O/D points for a game, residual", best)
+    return {p: bool(v) for p, v in zip(pts, x)}
+
+
+def point_summary(ps: pd.DataFrame, pl: pd.DataFrame) -> dict:
+    """O points, D points, holds, clean holds (scored on our first possession) and breaks."""
+    is_o = solve_o_points(ps)
+    scored = set(pl.loc[pl["assist"] == 1, "Point"])
+    turns = pl.groupby("Point")["turn"].sum()
+    return {
+        "o_points": sum(is_o.values()),
+        "d_points": sum(1 for v in is_o.values() if not v),
+        "holds_calc": sum(1 for p, o in is_o.items() if o and p in scored),
+        "clean_holds": sum(1 for p, o in is_o.items() if o and p in scored and turns.get(p, 0) == 0),
+        "breaks_calc": sum(1 for p, o in is_o.items() if not o and p in scored),
+    }
+
+
 # ---------------------------------------------------------------- svg helpers
 def esc(s) -> str:
     return html.escape(str(s), quote=True)
@@ -285,13 +340,21 @@ def score_cards(g: pd.DataFrame) -> str:
 
 
 def games_table(g: pd.DataFrame) -> str:
+    detailed = "clean_holds" in g.columns and g["clean_holds"].notna().all()
     rows = []
     for _, r in g.iterrows():
         cls = ' class="suspect"' if r["suspect"] else ""
-        rows.append(f"<tr{cls}><td>{esc(r.Opponent)}<span class=\"stage\">{esc(r.stage)}</span></td><td>{r.us}–{r.them}</td>"
-                    f"<td>{r.holds}</td><td>{r.breaks}</td><td>{r.turns}</td><td>{r.blocks}</td></tr>")
-    return ("<table><thead><tr><th>Opponent</th><th>Score</th><th>Holds</th><th>Breaks</th>"
-            "<th>Turns</th><th>Blocks</th></tr></thead><tbody>" + "".join(rows) + "</tbody></table>")
+        cells = [f'<td>{esc(r.Opponent)}<span class="stage">{esc(r.stage)}</span></td>', f"<td>{r.us}–{r.them}</td>"]
+        if detailed:
+            cells += [f"<td>{r.holds}/{r.o_points}</td>", f"<td>{r.clean_holds}</td>", f"<td>{r.breaks}/{r.d_points}</td>"]
+        else:
+            cells += [f"<td>{r.holds}</td>", f"<td>{r.breaks}</td>"]
+        cells += [f"<td>{r.turns}</td>", f"<td>{r.blocks}</td>"]
+        rows.append(f"<tr{cls}>{''.join(cells)}</tr>")
+    head = (["Opponent", "Score"] + (["Holds / O pts", "Clean holds", "Breaks / D pts"] if detailed else ["Holds", "Breaks"])
+            + ["Turns", "Blocks"])
+    return ('<div class="scroll"><table class="games"><thead><tr>' + "".join(f"<th>{h}</th>" for h in head)
+            + "</tr></thead><tbody>" + "".join(rows) + "</tbody></table></div>")
 
 
 def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single_game: bool, prefix: str) -> str:
@@ -303,11 +366,19 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
     add = lambda k, h: sec[k].append(h)
 
     # -- games
-    team_line = (f"{'This game' if single_game else f'Over the {len(clean)} games'}: {int(clean.holds.sum())} holds, "
-                 f"{int(clean.breaks.sum())} breaks, {int(clean.turns.sum())} turnovers, {int(clean.blocks.sum())} blocks.")
+    detailed = "clean_holds" in g.columns and g["clean_holds"].notna().all()
+    lead = "This game" if single_game else f"Over the {len(clean)} games"
+    if detailed:
+        o_n, d_n = int(clean.o_points.sum()), int(clean.d_points.sum())
+        h, ch, b = int(clean.holds.sum()), int(clean.clean_holds.sum()), int(clean.breaks.sum())
+        team_line = (f"{lead}: {h} holds from {o_n} O points ({h / o_n:.0%}), {ch} of them clean ({ch / o_n:.0%} of O points), "
+                     f"{b} breaks from {d_n} D points ({b / d_n:.0%}), {int(clean.turns.sum())} turnovers, {int(clean.blocks.sum())} blocks.")
+    else:
+        team_line = (f"{lead}: {int(clean.holds.sum())} holds, {int(clean.breaks.sum())} breaks, "
+                     f"{int(clean.turns.sum())} turnovers, {int(clean.blocks.sum())} blocks.")
     add("games", f"""
 <h2>{'Game' if single_game else 'Games'}</h2>
-<p class="muted">Holds are points we started on offence and won, breaks are points we started on defence and won.{' Greyed rows were only partly recorded.' if SUSPECT_GAMES and not single_game else ''}</p>
+<p class="muted">Holds are points we started on offence and won, breaks are points we started on defence and won.{' A clean hold is an O point scored on our first possession, without a turnover. Which points started on offence is worked out from the lineups in the per-game player stats and checked against Statto\'s hold and break counts.' if detailed else ''}{' Greyed rows were only partly recorded.' if SUSPECT_GAMES and not single_game else ''}</p>
 {games_table(g)}
 <p class="muted">{esc(team_line)}</p>""")
 
@@ -579,6 +650,7 @@ th {{ font-weight:500; color:var(--mist); }}
 tr.suspect td {{ color:var(--mist); }}
 td .stage {{ display:block; font-size:11px; color:var(--mist); line-height:1.1; }}
 .scroll {{ overflow-x:auto; margin:0 -18px; padding:0 18px; }}
+.games td, .games th {{ white-space:nowrap; }}
 .sheet th {{ cursor:pointer; user-select:none; white-space:normal; line-height:1.2; vertical-align:bottom; }}
 .sheet th.on {{ color:var(--ink); border-bottom:2px solid var(--ink); }}
 .sheet td:nth-child(even), .sheet th:nth-child(even) {{ background:#F3F6F9; }}
@@ -644,6 +716,17 @@ def build(p, g, passes, by_game) -> str:
     wins = int((g["Result"] == "Win").sum())
     losses = len(g) - wins
     game_names = list(g["Opponent"])
+    for col in ("o_points", "d_points", "clean_holds"):
+        g[col] = pd.NA
+    for opp in game_names:
+        pi = passes[passes["game"] == opp] if len(passes) else passes
+        if opp in by_game and len(pi):
+            ps_ = by_game[opp]
+            summ = point_summary(ps_, pi)
+            if summ["holds_calc"] != int(g.loc[g["Opponent"] == opp, "holds"].iloc[0]):
+                print(f"warning: derived holds differ from Statto for {opp}")
+            for col in ("o_points", "d_points", "clean_holds"):
+                g.loc[g["Opponent"] == opp, col] = summ[col]
 
     views = [f'<section class="view on" data-view="all">{build_view(p, g, passes, single_game=False, prefix="all")}</section>']
     tabs = ['<button class="on" data-view="all">All games</button>']
