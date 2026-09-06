@@ -20,6 +20,7 @@ import html
 import re
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 # ADAPT: paths, labels, output
@@ -33,7 +34,7 @@ EVENT_LABEL = "WUCC 2026"
 
 # ADAPT: short display names keyed by the exact "Player" value in the export.
 # Anyone not listed is shown by first name, duplicates get their jersey number.
-NICKNAMES = {"12 Anika Gnaedinger": "Ani"}
+NICKNAMES = {"12 Anika Gnaedinger": "Ani", "54 Thanh Elsener": "Trissy"}
 
 # ADAPT: scoring conventions and thresholds
 A2_WEIGHT = 0.0         # credit for a hockey assist in +/-: 0 (common), 0.5 (fantasy-style) or 1
@@ -56,8 +57,10 @@ MATCHING = {
     "54 Thanh Elsener": "FMP",
 }
 TOP_TARGETS = 3   # how many favourite targets / throwers to list per player
+THROWER_SHARE = 0.5   # share of a completed pass's value credited to the thrower, rest to the receiver
+ROSE_SECTORS = 12     # direction sectors in the tendency radials
 # ADAPT: order of the sections on the page
-SECTION_ORDER = ["games", "sheet", "playing", "throwing", "connections", "receiving", "scoring", "points_won"]
+SECTION_ORDER = ["games", "sheet", "playing", "throwing", "connections", "receiving", "scoring", "points_won", "models"]
 
 # ADAPT: actual schedule, keyed by opponent as named in the Games export. Overrides the
 # dates and times Statto recorded (which are when the game was tagged, not played) and
@@ -165,7 +168,80 @@ def load_passes() -> pd.DataFrame:
     # expected completion: team rate within the throw's forward-distance bin, over all logged games
     d["bin"] = pd.cut(d["fwd"], EXPECT_BINS, right=False)
     d["expected"] = d.groupby("bin", observed=True)["completed"].transform("mean")
+    d = d.rename(columns=COORD_RENAMES)
+    d, models = fit_models(d)
+    d.attrs["models"] = models
     return d
+
+
+COORD_RENAMES = {
+    "Start X (0 -> 1 = left sideline -> right sideline)": "sx",
+    "Start Y (0 -> 1 = back of opponent endzone -> back of own endzone)": "sy",
+    "End X (0 -> 1 = left sideline -> right sideline)": "ex",
+    "End Y (0 -> 1 = back of opponent endzone -> back of own endzone)": "ey",
+    "Distance (m)": "dist", "Left-to-right distance (m)": "lat",
+}
+
+
+def _logit_fit(X, y, l2=1e-3, iters=60):
+    """Ridge-regularised logistic regression by Newton's method (no sklearn needed)."""
+    X = np.column_stack([np.ones(len(X)), X])
+    w = np.zeros(X.shape[1])
+    for _ in range(iters):
+        p = 1 / (1 + np.exp(-X @ w))
+        W = p * (1 - p)
+        H = X.T @ (X * W[:, None]) + l2 * np.eye(X.shape[1])
+        g = X.T @ (y - p) - l2 * w
+        step = np.linalg.solve(H, g)
+        w += step
+        if np.abs(step).max() < 1e-8:
+            break
+    return w
+
+
+def _logit_pred(w, X):
+    X = np.column_stack([np.ones(len(X)), X])
+    return 1 / (1 + np.exp(-X @ w))
+
+
+def _xs_feats(y, x):
+    return np.column_stack([y, y ** 2, np.abs(x - 0.5)])
+
+
+def _cp_feats(d):
+    return np.column_stack([d["dist"], d["dist"] ** 2 / 50, d["fwd"], np.abs(d["lat"]), d["sy"], np.abs(d["sx"] - 0.5)])
+
+
+def fit_models(d: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
+    """Expected score by field position, expected completion probability, and per-pass
+    expected contribution, all fitted on the logged games themselves.
+
+    P(score | position): logistic in distance to the end zone (linear + quadratic) and
+    distance from the centre line, fitted on every pass start position with the
+    possession's outcome as the label.
+    xCP: logistic in throw length, forward gain, lateral movement and start position.
+    Contribution of a completed pass = P(score at end) - P(score at start), split
+    THROWER_SHARE / (1 - THROWER_SHARE) between thrower and receiver. A turnover costs
+    P(score at start): the thrower for a throwaway, the receiver for a drop. The
+    opponent's counter-value is left out because the logs hold no defensive events to
+    balance it, so the team's numbers sum to about zero by construction."""
+    d = d.copy()
+    d["pid"] = d["game"] + "|" + d["Point"].astype(str) + "|" + d["Possession"].astype(str)
+    d["scored"] = d["pid"].map(d.groupby("pid")["assist"].max())
+    w_xs = _logit_fit(_xs_feats(d["sy"].values, d["sx"].values), d["scored"].values.astype(float))
+    w_cp = _logit_fit(_cp_feats(d), d["completed"].values.astype(float), l2=1e-2)
+    d["xs_start"] = _logit_pred(w_xs, _xs_feats(d["sy"].values, d["sx"].values))
+    d["xs_end"] = np.where(d["assist"] == 1, 1.0, _logit_pred(w_xs, _xs_feats(d["ey"].values, d["ex"].values)))
+    d["xcp"] = _logit_pred(w_cp, _cp_feats(d))
+    gain = d["xs_end"] - d["xs_start"]
+    d["ec_thrower"] = np.where(d["completed"] == 1, THROWER_SHARE * gain, np.where(d["te"] == 1, -d["xs_start"], 0.0))
+    d["ec_receiver"] = np.where(d["completed"] == 1, (1 - THROWER_SHARE) * gain, np.where(d["re"] == 1, -d["xs_start"], 0.0))
+    info = {
+        "possessions": int(d["pid"].nunique()), "goals": int(d.groupby("pid")["assist"].max().sum()),
+        "xs_curve": [(y, float(_logit_pred(w_xs, _xs_feats(np.array([y]), np.array([0.5])))[0]),
+                      float(_logit_pred(w_xs, _xs_feats(np.array([y]), np.array([0.05])))[0])) for y in (0.23, 0.38, 0.53, 0.68, 0.83)],
+    }
+    return d, info
 
 
 def players_from_passes(d: pd.DataFrame) -> pd.DataFrame:
@@ -321,6 +397,30 @@ def stacked_bars(rows, *, colors=(SPLASH, AMBER), label_w=118, bar_w=300, row_h=
         out.append(f'<text x="{x + 6:.1f}" y="{y + 15}" fill="{INK}">{sum(vals):.0f}</text>')
     out.append("</svg>")
     return "\n".join(out)
+
+
+def rose_svg(counts_throw, counts_catch, size=96) -> str:
+    """Two direction roses side by side: throws (blue) and catches (amber). Forward is up."""
+    import math
+    n = len(counts_throw)
+    out = [f'<svg viewBox="0 0 {2 * size} {size}" width="{2 * size}" height="{size}">']
+    for k, (counts, color) in enumerate(((counts_throw, SPLASH), (counts_catch, AMBER))):
+        cx, cy, r = k * size + size / 2, size / 2, size / 2 - 4
+        out.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="none" stroke="{RULE}"/>')
+        out.append(f'<line x1="{cx}" x2="{cx}" y1="{cy - r}" y2="{cy + r}" stroke="{RULE}"/>')
+        out.append(f'<line x1="{cx - r}" x2="{cx + r}" y1="{cy}" y2="{cy}" stroke="{RULE}"/>')
+        m = max(counts) or 1
+        for i, c in enumerate(counts):
+            if not c:
+                continue
+            rr = r * math.sqrt(c / m)
+            a0 = (i - 0.5) * 2 * math.pi / n
+            a1 = (i + 0.5) * 2 * math.pi / n
+            x0, y0 = cx + rr * math.sin(a0), cy - rr * math.cos(a0)
+            x1, y1 = cx + rr * math.sin(a1), cy - rr * math.cos(a1)
+            out.append(f'<path d="M{cx:.1f},{cy:.1f} L{x0:.1f},{y0:.1f} A{rr:.1f},{rr:.1f} 0 0 1 {x1:.1f},{y1:.1f} Z" fill="{color}" fill-opacity="0.75"/>')
+    out.append("</svg>")
+    return "".join(out)
 
 
 # ---------------------------------------------------------------- page pieces
@@ -550,6 +650,58 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
 <p class="muted">Per player, completed/attempted.</p>
 {per_kind_table}""")
 
+    # -- model-based section (Shown Space style)
+    if has_passes and "ec_thrower" in passes.columns:
+        info = passes.attrs.get("models", {})
+        short = dict(zip(p["Player"], p["short"]))
+        nm = lambda x: short.get(x, re.sub(r"^\d+\s+", "", str(x)).split()[0])
+        pm_ = passes.assign(t=passes["Thrower"].map(nm), r=passes["Receiver"].map(nm))
+        thr = pm_.groupby("t").agg(throws=("completed", "size"), ec_t=("ec_thrower", "sum"), xcp=("xcp", "mean"),
+                                   comp=("completed", "sum"), xcomp=("xcp", "sum"))
+        thr["cpoe"] = thr["comp"] - thr["xcomp"]
+        rec = pm_.groupby("r").agg(ec_r=("ec_receiver", "sum"))
+        ev = thr.join(rec, how="outer").fillna(0)
+        ev["total"] = ev["ec_t"] + ev["ec_r"]
+        ev = ev.sort_values("total", ascending=False)
+        ec_svg = diverging_bars([(t, r_.total, f"(thrower {r_.ec_t:+.1f}, receiver {r_.ec_r:+.1f})") for t, r_ in ev.iterrows()],
+                                value_fmt="{:+.2f}")
+        cp = ev[ev["throws"] > 0].sort_values("cpoe", ascending=False)
+        cpoe_svg = diverging_bars([(t, r_.cpoe, f"(xCP {r_.xcp:.0%}, {int(r_.comp)}/{int(r_.throws)})") for t, r_ in cp.iterrows()])
+        xs_rows = "".join(f"<tr><td>{int(round((y - 0.18) * 100))} m from the end zone we attack</td><td>{mid:.0%}</td><td>{side:.0%}</td></tr>"
+                          for y, mid, side in info.get("xs_curve", []))
+        xs_table = ('<table><thead><tr><th>Disc position</th><th>Middle</th><th>Sideline</th></tr></thead>'
+                    f'<tbody>{xs_rows}</tbody></table>')
+
+        ang = np.degrees(np.arctan2(pm_["lat"], pm_["fwd"]))
+        sector = ((ang + 360 / ROSE_SECTORS / 2) % 360 // (360 / ROSE_SECTORS)).astype(int)
+        pm_ = pm_.assign(sector=sector)
+        order = [nm(x) for x in p.sort_values("throws", ascending=False)["Player"]]
+        cards = []
+        for who in order:
+            th = pm_[pm_["t"] == who]["sector"].value_counts().reindex(range(ROSE_SECTORS), fill_value=0).tolist()
+            ca = pm_[(pm_["r"] == who) & (pm_["completed"] == 1)]["sector"].value_counts().reindex(range(ROSE_SECTORS), fill_value=0).tolist()
+            if not sum(th) and not sum(ca):
+                continue
+            cards.append(f'<div class="rose"><div class="rose-name">{esc(who)}</div>{rose_svg(th, ca)}'
+                         f'<div class="muted">{sum(th)} throws · {sum(ca)} catches</div></div>')
+        roses = ("" if single_game else
+                 '<h3>Tendency radials</h3>\n<p class="muted">The direction of each player\'s throws (blue) and of the throws they catch (amber), with forward at the top and the field\'s right on the right. Wedge size grows with the share of throws in that direction, so a deep cutter shows a tall amber wedge and a reset handler a wide blue base.</p>\n'
+                 '<div class="roses">' + "".join(cards) + "</div>")
+
+        add("models", f"""
+<h2>Expected contribution</h2>
+<p>A simplified version of the Shown Space approach used for the UFA. Two models are fitted on the logged games themselves. The first gives the probability that a possession ends in a goal from where the disc is, from {info.get('possessions', 0)} possessions and {info.get('goals', 0)} goals. The second gives the probability that a throw is completed from its length, direction and start position. With ten games of data these are rough, so read the rankings as a first look, not a verdict.</p>
+<h3>Chance of scoring by disc position</h3>
+<p class="muted">Probability that our possession ends in a goal when the disc is at this spot, in the middle of the field or near a sideline.</p>
+{xs_table}
+<h3>Expected contribution</h3>
+<p class="muted">Every completed pass is worth the change in scoring chance from where it started to where it was caught, shared {THROWER_SHARE:.0%} to the thrower and {1 - THROWER_SHARE:.0%} to the receiver. A turnover costs the scoring chance the possession had, charged to the thrower for a throwaway and to the receiver for a drop. Units are goals. A pure position model marks resets slightly negative, since they move the disc away from the end zone, so reset handlers sit lower than their value to the offence.</p>
+{ec_svg}
+<h3>Completion probability over expected</h3>
+<p class="muted">Completions minus the sum of each throw's expected completion probability (xCP). Average xCP shows how risky a player's throws are, the count shows how they did against that.</p>
+{cpoe_svg}
+{roses}""")
+
     # -- receiving
     rc = p[p["catches"] > 0].sort_values("gain_per_catch", ascending=False)
     add("receiving", f"""
@@ -602,7 +754,8 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         titles.append((title, f"{prefix}-{slug}"))
         return f'<h2 id="{prefix}-{slug}">{title}</h2>'
     body = re.sub(r"<h2>([^<]*)</h2>", anchor, body)
-    toc = '<nav class="toc">' + "".join(f'<a href="#{i}">{esc(t)}</a>' for t, i in titles) + "</nav>"
+    toc = ('<nav class="toc">' + "".join(f'<a href="#{i}">{esc(t)}</a>' for t, i in titles)
+           + '<a href="#definitions">Definitions and sources</a></nav>')
     return toc + body
 
 
@@ -667,11 +820,17 @@ td .stage {{ display:block; font-size:11px; color:var(--mist); line-height:1.1; 
 .matrix td[title] {{ cursor:pointer; }}
 .matrix td.picked {{ outline:2px solid var(--ink); outline-offset:-2px; }}
 .matrix-note {{ min-height:1.4em; margin-top:8px; }}
+.roses {{ margin-top:6px; }}
+.rose {{ display:inline-block; vertical-align:top; width:200px; margin:0 8px 14px 0; font-size:12px; }}
+.rose-name {{ font-weight:600; margin-bottom:2px; }}
+.rose .muted {{ font-size:11px; margin:0; }}
 .legend {{ font-size:13px; color:var(--mist); margin:0 0 6px; }}
 .legend i {{ display:inline-block; width:10px; height:10px; border-radius:2px; margin:0 5px 0 12px; vertical-align:-1px; }}
 svg text {{ font-family:inherit; }}
 footer {{ margin-top:56px; padding-top:16px; border-top:1px solid var(--rule); font-size:13px; color:var(--mist); }}
 footer p {{ max-width:70ch; }}
+footer a {{ color:var(--splash); }}
+footer code {{ font-size:12px; }}
 """
 
 JS = """
@@ -765,8 +924,13 @@ def build(p, g, passes, by_game) -> str:
 </div>
 <nav class="tabs">{''.join(tabs)}</nav>
 {''.join(views)}
-<footer>
-<p>Stats tagged in Statto by rewatching the game videos, so they are more complete than live stats but still hand-counted, and small errors are possible. Throw and catch gains are Statto's own distance estimates from tapped field positions. Completion percentage counts only throwaways against the thrower, not drops.</p>
+<footer id="definitions">
+<h2 style="font-size:18px; margin-top:0;">Definitions and sources</h2>
+<p><b>How the data was recorded.</b> Stats tagged in Statto by rewatching the game videos, so they are more complete than live stats but still hand-counted, and small errors are possible. Throw and catch gains are Statto's own distance estimates from the tapped field positions.</p>
+<p><b>Box-score stats.</b> Goals, assists, hockey assists (A2, the pass before the assist), blocks, throwaways, drops, holds and breaks follow the usual ultimate definitions, the same as in Statto, Ultiworld and UltiAnalytics. Turnovers are throwaways plus drops. Completion percentage counts only throwaways against the thrower. +/- is goals + assists + blocks − turnovers{a2_note()}, a common convention rather than a rule. A clean hold is an O point scored on our first possession. Which points started on offence is reconstructed from the lineups in the per-game player stats and matches Statto's hold and break counts in every game.</p>
+<p><b>Throw categories.</b> Swing and dump are Statto's flags. From this data they work out as: dump is any pass that goes backwards, swing moves the disc at least 11 m across the field within about 8 m forward or back. Long (20 m or more forward) is our own threshold, chosen because the completion rate drops sharply there.</p>
+<p><b>Completions over expected (Throwing section).</b> Each throw is compared with the team completion rate for throws in the same forward-distance bin, and the differences are summed. A standard observed-minus-expected construction. If a player were exactly average, the standard deviation of that sum over n throws is about √(n·p·(1−p)), roughly 3.5 at 130 throws, so single-goal differences are noise.</p>
+<p><b>Expected contribution section.</b> Concepts borrowed from <a href="https://shownspace.com/">Shown Space</a>, the analytics project built on UFA data (see their <a href="https://shownspace.substack.com/p/welcome-to-shown-space-your-field">introduction</a> and the <a href="https://www.watchufa.com/league/news/2026-ufa-shown-space-stats-analytics-introduction">UFA article</a>): aEC accumulates the change in the team's expected scoring probability over a player's actions, xCP is a throw's expected completion probability from distance, angle and field position, CPOE is completion rate against that expectation, and tendency radials show throw directions. The models on this page are not theirs. They are two small ridge logistic regressions fitted on this event's own {passes.attrs.get("models", {}).get("possessions", 0) if len(passes) else 0} possessions: scoring chance from distance to the end zone (linear and squared) and distance from the centre line, and completion chance from throw length, forward gain, lateral movement and start position. A completed pass is credited with the change in scoring chance, split {THROWER_SHARE:.0%} thrower and {1 - THROWER_SHARE:.0%} receiver, and a turnover costs the scoring chance the possession had. The opponent's value after a turnover is left out, since there are no defensive events in the log to balance it, so the team's total is about zero by construction. CPOE here is a count of completions above expectation, not a percentage. The "over expected" idea itself comes from football analytics, where <a href="https://www.nfeloapp.com/analysis/over-expected-explained-what-are-cpoe-ryoe-and-yacoe/">this explainer</a> makes the fair point that such numbers are model errors and inherit the model's blind spots. Full formulas are in the docstring of <code>fit_models</code> in the build script.</p>
 </footer>
 </main>
 <script>{JS}</script>
