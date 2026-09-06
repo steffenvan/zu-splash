@@ -222,7 +222,8 @@ def fit_models(d: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     xCP: logistic in throw length, forward gain, lateral movement and start position.
     Contribution of a completed pass = P(score at end) - P(score at start), split
     THROWER_SHARE / (1 - THROWER_SHARE) between thrower and receiver. A turnover costs
-    P(score at start): the thrower for a throwaway, the receiver for a drop. The
+    P(score at start): the thrower for a throwaway, the receiver for a drop, half each
+    when Statto tagged both. The
     opponent's counter-value is left out because the logs hold no defensive events to
     balance it, so the team's numbers sum to about zero by construction."""
     d = d.copy()
@@ -234,8 +235,11 @@ def fit_models(d: pd.DataFrame) -> tuple[pd.DataFrame, dict]:
     d["xs_end"] = np.where(d["assist"] == 1, 1.0, _logit_pred(w_xs, _xs_feats(d["ey"].values, d["ex"].values)))
     d["xcp"] = _logit_pred(w_cp, _cp_feats(d))
     gain = d["xs_end"] - d["xs_start"]
-    d["ec_thrower"] = np.where(d["completed"] == 1, THROWER_SHARE * gain, np.where(d["te"] == 1, -d["xs_start"], 0.0))
-    d["ec_receiver"] = np.where(d["completed"] == 1, (1 - THROWER_SHARE) * gain, np.where(d["re"] == 1, -d["xs_start"], 0.0))
+    # a turnover tagged as both throwaway and drop (shared fault) is charged half to each
+    blame_t = d["te"] / (d["te"] + d["re"]).replace(0, 1)
+    blame_r = d["re"] / (d["te"] + d["re"]).replace(0, 1)
+    d["ec_thrower"] = np.where(d["completed"] == 1, THROWER_SHARE * gain, -blame_t * d["xs_start"])
+    d["ec_receiver"] = np.where(d["completed"] == 1, (1 - THROWER_SHARE) * gain, -blame_r * d["xs_start"])
     info = {
         "possessions": int(d["pid"].nunique()), "goals": int(d.groupby("pid")["assist"].max().sum()),
         "xs_curve": [(y, float(_logit_pred(w_xs, _xs_feats(np.array([y]), np.array([0.5])))[0]),
@@ -666,7 +670,9 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         ec_svg = diverging_bars([(t, r_.total, f"(thrower {r_.ec_t:+.1f}, receiver {r_.ec_r:+.1f})") for t, r_ in ev.iterrows()],
                                 value_fmt="{:+.2f}")
         cp = ev[ev["throws"] > 0].sort_values("cpoe", ascending=False)
-        cpoe_svg = diverging_bars([(t, r_.cpoe, f"(xCP {r_.xcp:.0%}, {int(r_.comp)}/{int(r_.throws)})") for t, r_ in cp.iterrows()])
+        cp = cp.assign(cpoe_pct=100 * cp["cpoe"] / cp["throws"]).sort_values("cpoe_pct", ascending=False)
+        cpoe_svg = diverging_bars([(t, r_.cpoe_pct, f"({int(r_.comp)}/{int(r_.throws)}, expected {r_.xcomp:.1f}, xCP {r_.xcp:.0%})")
+                                   for t, r_ in cp.iterrows()], value_fmt="{:+.1f} pts")
         xs_rows = "".join(f"<tr><td>{int(round((y - 0.18) * 100))} m from the end zone we attack</td><td>{mid:.0%}</td><td>{side:.0%}</td></tr>"
                           for y, mid, side in info.get("xs_curve", []))
         xs_table = ('<table><thead><tr><th>Disc position</th><th>Middle</th><th>Sideline</th></tr></thead>'
@@ -695,10 +701,10 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
 <p class="muted">Probability that our possession ends in a goal when the disc is at this spot, in the middle of the field or near a sideline.</p>
 {xs_table}
 <h3>Expected contribution</h3>
-<p class="muted">Every completed pass is worth the change in scoring chance from where it started to where it was caught, shared {THROWER_SHARE:.0%} to the thrower and {1 - THROWER_SHARE:.0%} to the receiver. A turnover costs the scoring chance the possession had, charged to the thrower for a throwaway and to the receiver for a drop. Units are goals. A pure position model marks resets slightly negative, since they move the disc away from the end zone, so reset handlers sit lower than their value to the offence.</p>
+<p class="muted">Every completed pass is worth the change in scoring chance from where it started to where it was caught, shared {THROWER_SHARE:.0%} to the thrower and {1 - THROWER_SHARE:.0%} to the receiver. A turnover costs the scoring chance the possession had, charged to the thrower for a throwaway and to the receiver for a drop, and half each when Statto tagged both. Units are goals. A pure position model marks resets slightly negative, since they move the disc away from the end zone, so reset handlers sit lower than their value to the offence.</p>
 {ec_svg}
 <h3>Completion probability over expected</h3>
-<p class="muted">Completions minus the sum of each throw's expected completion probability (xCP). Average xCP shows how risky a player's throws are, the count shows how they did against that.</p>
+<p class="muted">A player's completion rate minus the rate a typical teammate would have had on the same throws, in percentage points. For each throw the model gives a completion chance from its length, direction and start position, without knowing who threw it. Summing those gives the expected completions, in grey next to the actual count. The average of those chances is the player's xCP: high means safe throw selection, low means ambitious. So 32/32 with an xCP of 93% is +7 points, and 234/259 with an xCP of 89% is about +2. On few throws this swings wildly, so read it with the throw count. "pts" means percentage points, the plain difference between the two completion rates (100% minus 93% is 7 points), rather than a relative change.</p>
 {cpoe_svg}
 {roses}""")
 
@@ -741,7 +747,7 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
     tot_line = ", ".join(f"{tot[c]:g} {h if h == 'A2' else h.lower()}" for h, c in cols[1:] if c in tot)
     add("sheet", f"""
 <h2>Full stat sheet</h2>
-<p class="muted">Every player. Tap a column heading to sort by it. A2 is the hockey assist, the pass before the assist. Turnovers are throwaways plus drops.{' +/- is goals + assists + blocks − turnovers' + a2_note() + '.' if full else ''} Sorted by goals + assists + hockey assists.</p>
+<p class="muted">Every player. Tap a column heading to sort by it. A2 is the hockey assist, the pass before the assist. Turnovers are throwaways plus drops, so a turnover Statto blamed on both players counts once for each.{' +/- is goals + assists + blocks − turnovers' + a2_note() + '.' if full else ''} Sorted by goals + assists + hockey assists.</p>
 <div class="scroll"><table class="sheet"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>
 <p class="muted">Team totals: {tot_line}.</p>""")
 
@@ -927,10 +933,10 @@ def build(p, g, passes, by_game) -> str:
 <footer id="definitions">
 <h2 style="font-size:18px; margin-top:0;">Definitions and sources</h2>
 <p><b>How the data was recorded.</b> Stats tagged in Statto by rewatching the game videos, so they are more complete than live stats but still hand-counted, and small errors are possible. Throw and catch gains are Statto's own distance estimates from the tapped field positions.</p>
-<p><b>Box-score stats.</b> Goals, assists, hockey assists (A2, the pass before the assist), blocks, throwaways, drops, holds and breaks follow the usual ultimate definitions, the same as in Statto, Ultiworld and UltiAnalytics. Turnovers are throwaways plus drops. Completion percentage counts only throwaways against the thrower. +/- is goals + assists + blocks − turnovers{a2_note()}, a common convention rather than a rule. A clean hold is an O point scored on our first possession. Which points started on offence is reconstructed from the lineups in the per-game player stats and matches Statto's hold and break counts in every game.</p>
+<p><b>Box-score stats.</b> Goals, assists, hockey assists (A2, the pass before the assist), blocks, throwaways, drops, holds and breaks follow the usual ultimate definitions, the same as in Statto, Ultiworld and UltiAnalytics. Turnovers in the stat sheet are throwaways plus drops, which is Statto's per-player count. It is higher than the team's turnover count because Statto sometimes tags one turnover as both a throwaway and a drop, when thrower and receiver share the blame. +/- is goals + assists + blocks − turnovers{a2_note()}, a common convention rather than a rule. A clean hold is an O point scored on our first possession. Which points started on offence is reconstructed from the lineups in the per-game player stats and matches Statto's hold and break counts in every game.</p>
 <p><b>Throw categories.</b> Swing and dump are Statto's flags. From this data they work out as: dump is any pass that goes backwards, swing moves the disc at least 11 m across the field within about 8 m forward or back. Long (20 m or more forward) is our own threshold, chosen because the completion rate drops sharply there.</p>
 <p><b>Completions over expected (Throwing section).</b> Each throw is compared with the team completion rate for throws in the same forward-distance bin, and the differences are summed. A standard observed-minus-expected construction. If a player were exactly average, the standard deviation of that sum over n throws is about √(n·p·(1−p)), roughly 3.5 at 130 throws, so single-goal differences are noise.</p>
-<p><b>Expected contribution section.</b> Concepts borrowed from <a href="https://shownspace.com/">Shown Space</a>, the analytics project built on UFA data (see their <a href="https://shownspace.substack.com/p/welcome-to-shown-space-your-field">introduction</a> and the <a href="https://www.watchufa.com/league/news/2026-ufa-shown-space-stats-analytics-introduction">UFA article</a>): aEC accumulates the change in the team's expected scoring probability over a player's actions, xCP is a throw's expected completion probability from distance, angle and field position, CPOE is completion rate against that expectation, and tendency radials show throw directions. The models on this page are not theirs. They are two small ridge logistic regressions fitted on this event's own {passes.attrs.get("models", {}).get("possessions", 0) if len(passes) else 0} possessions: scoring chance from distance to the end zone (linear and squared) and distance from the centre line, and completion chance from throw length, forward gain, lateral movement and start position. A completed pass is credited with the change in scoring chance, split {THROWER_SHARE:.0%} thrower and {1 - THROWER_SHARE:.0%} receiver, and a turnover costs the scoring chance the possession had. The opponent's value after a turnover is left out, since there are no defensive events in the log to balance it, so the team's total is about zero by construction. CPOE here is a count of completions above expectation, not a percentage. The "over expected" idea itself comes from football analytics, where <a href="https://www.nfeloapp.com/analysis/over-expected-explained-what-are-cpoe-ryoe-and-yacoe/">this explainer</a> makes the fair point that such numbers are model errors and inherit the model's blind spots. Full formulas are in the docstring of <code>fit_models</code> in the build script.</p>
+<p><b>Expected contribution section.</b> Concepts borrowed from <a href="https://shownspace.com/">Shown Space</a>, the analytics project built on UFA data (see their <a href="https://shownspace.substack.com/p/welcome-to-shown-space-your-field">introduction</a> and the <a href="https://www.watchufa.com/league/news/2026-ufa-shown-space-stats-analytics-introduction">UFA article</a>): aEC accumulates the change in the team's expected scoring probability over a player's actions, xCP is a throw's expected completion probability from distance, angle and field position, CPOE is completion rate against that expectation, and tendency radials show throw directions. The models on this page are not theirs. They are two small ridge logistic regressions fitted on this event's own {passes.attrs.get("models", {}).get("possessions", 0) if len(passes) else 0} possessions: scoring chance from distance to the end zone (linear and squared) and distance from the centre line, and completion chance from throw length, forward gain, lateral movement and start position. A completed pass is credited with the change in scoring chance, split {THROWER_SHARE:.0%} thrower and {1 - THROWER_SHARE:.0%} receiver, and a turnover costs the scoring chance the possession had, split when both players were blamed. The opponent's value after a turnover is left out, since there are no defensive events in the log to balance it, so the team's total is about zero by construction. CPOE here is in percentage points (written pts), the actual completion rate minus the expected one, so 100% against an expected 93% is +7 pts. It is a plain difference of two rates, not a relative increase. The completion count and expected completions are shown alongside. The "over expected" idea itself comes from football analytics, where <a href="https://www.nfeloapp.com/analysis/over-expected-explained-what-are-cpoe-ryoe-and-yacoe/">this explainer</a> makes the fair point that such numbers are model errors and inherit the model's blind spots. Full formulas are in the docstring of <code>fit_models</code> in the build script.</p>
 </footer>
 </main>
 <script>{JS}</script>
