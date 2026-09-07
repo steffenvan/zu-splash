@@ -535,13 +535,32 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         nm = lambda x: short.get(x, re.sub(r"^\d+\s+", "", str(x)).split()[0])
         pl = passes.assign(t=passes["Thrower"].map(nm), r=passes["Receiver"].map(nm))
 
-        ce = pl.groupby("t").agg(n=("completed", "size"), comp=("completed", "sum"), exp=("expected", "sum"))
-        ce["coe"] = ce.comp - ce.exp
-        ce = ce.sort_values("coe", ascending=False)
-        coe_svg = diverging_bars([(t, r.coe, f"({int(r.comp)}/{int(r.n)}, expected {r.exp:.1f})") for t, r in ce.iterrows()])
-        add("throwing", f"""
+        if "xcp" in pl.columns:
+            ce = pl.groupby("t").agg(n=("completed", "size"), comp=("completed", "sum"), exp=("xcp", "sum"), xcp=("xcp", "mean"))
+            ce["count"] = ce.comp - ce.exp
+            ce["pts"] = 100 * ce["count"] / ce.n
+            by_pts = ce.sort_values("pts", ascending=False)
+            by_cnt = ce.sort_values("count", ascending=False)
+            pts_svg = diverging_bars([(t, r.pts, f"({int(r.comp)}/{int(r.n)}, expected {r.exp:.1f}, xCP {r.xcp:.0%})") for t, r in by_pts.iterrows()],
+                                     value_fmt="{:+.1f} pts")
+            cnt_svg = diverging_bars([(t, r["count"], f"({int(r.comp)}/{int(r.n)}, expected {r.exp:.1f}, {r.pts:+.1f} pts)") for t, r in by_cnt.iterrows()],
+                                     value_fmt="{:+.1f}")
+            add("throwing", f"""
+<h3>Completion probability over expected (CPOE)</h3>
+<p class="muted">How much better a player completes than a typical teammate would on the same throws. For each throw a model fitted on this event's pass logs gives a completion chance from its length, direction and start position, without knowing who threw it. Summing those gives the expected completions, shown in grey next to the actual count. The average of those chances is the player's xCP: high means safe throw selection, low means ambitious. It adjusts for the throw, not the situation, so D-line throwers after a block are held to the same bar as the O-line. Because the model looks at more than distance, it also credits throws that start in awkward spots. Over the whole event Quinn is the clearest case: his throws are longer than the team's (13.9 m against 12.2 m on average), start slightly further from the end zone and a little more often near a sideline, so the model expects about 1.7 fewer completions from him than throw distance alone would, and his CPOE is higher for it.</p>
+<p class="muted">The same numbers are shown two ways. Per throw, in percentage points: the player's completion rate minus the expected rate, so 32/32 with an xCP of 93% is +7 pts. This is fair between a handler and a cutter but swings wildly on few throws. As a count: completions minus expected completions, so the same 32/32 is +2.1. This rewards volume and is far less noisy. A reset handler tends to look better per throw, a workhorse better by count. "pts" means percentage points, the plain difference between two rates, not a relative change.</p>
+<h3 style="font-size:14px; margin-top:14px;">Per throw</h3>
+{pts_svg}
+<h3 style="font-size:14px;">As a count</h3>
+{cnt_svg}""")
+        else:
+            ce = pl.groupby("t").agg(n=("completed", "size"), comp=("completed", "sum"), exp=("expected", "sum"))
+            ce["coe"] = ce.comp - ce.exp
+            ce = ce.sort_values("coe", ascending=False)
+            coe_svg = diverging_bars([(t, r.coe, f"({int(r.comp)}/{int(r.n)}, expected {r.exp:.1f})") for t, r in ce.iterrows()])
+            add("throwing", f"""
 <h3>Completions over expected</h3>
-<p class="muted">Each throw is compared with the team completion rate over the whole event for throws of the same forward distance, and the differences are summed per player. Positive means completing harder throws than a typical teammate would. It adjusts for distance, not for situation, so D-line throwers after a block are held to the same bar as the O-line.</p>
+<p class="muted">Each throw is compared with the team completion rate for throws of the same forward distance, and the differences are summed per player. Positive means completing harder throws than a typical teammate would.</p>
 {coe_svg}""")
 
         # connections
@@ -669,10 +688,6 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         ev = ev.sort_values("total", ascending=False)
         ec_svg = diverging_bars([(t, r_.total, f"(thrower {r_.ec_t:+.1f}, receiver {r_.ec_r:+.1f})") for t, r_ in ev.iterrows()],
                                 value_fmt="{:+.2f}")
-        cp = ev[ev["throws"] > 0].sort_values("cpoe", ascending=False)
-        cp = cp.assign(cpoe_pct=100 * cp["cpoe"] / cp["throws"]).sort_values("cpoe_pct", ascending=False)
-        cpoe_svg = diverging_bars([(t, r_.cpoe_pct, f"({int(r_.comp)}/{int(r_.throws)}, expected {r_.xcomp:.1f}, xCP {r_.xcp:.0%})")
-                                   for t, r_ in cp.iterrows()], value_fmt="{:+.1f} pts")
         xs_rows = "".join(f"<tr><td>{int(round((y - 0.18) * 100))} m from the end zone we attack</td><td>{mid:.0%}</td><td>{side:.0%}</td></tr>"
                           for y, mid, side in info.get("xs_curve", []))
         xs_table = ('<table><thead><tr><th>Disc position</th><th>Middle</th><th>Sideline</th></tr></thead>'
@@ -696,16 +711,13 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
 
         add("models", f"""
 <h2>Expected contribution</h2>
-<p>A simplified version of the Shown Space approach used for the UFA. Two models are fitted on the logged games themselves. The first gives the probability that a possession ends in a goal from where the disc is, from {info.get('possessions', 0)} possessions and {info.get('goals', 0)} goals. The second gives the probability that a throw is completed from its length, direction and start position. With ten games of data these are rough, so read the rankings as a first look, not a verdict.</p>
+<p>A simplified version of the Shown Space approach used for the UFA. Two models are fitted on the logged games themselves. The first gives the probability that a possession ends in a goal from where the disc is, from {info.get('possessions', 0)} possessions and {info.get('goals', 0)} goals. The second gives the probability that a throw is completed from its length, direction and start position, which is what the CPOE chart in the Throwing section uses. With ten games of data these are rough, so read the rankings as a first look, not a verdict.</p>
 <h3>Chance of scoring by disc position</h3>
 <p class="muted">Probability that our possession ends in a goal when the disc is at this spot, in the middle of the field or near a sideline.</p>
 {xs_table}
 <h3>Expected contribution</h3>
 <p class="muted">Every completed pass is worth the change in scoring chance from where it started to where it was caught, shared {THROWER_SHARE:.0%} to the thrower and {1 - THROWER_SHARE:.0%} to the receiver. A turnover costs the scoring chance the possession had, charged to the thrower for a throwaway and to the receiver for a drop, and half each when Statto tagged both. Units are goals. A pure position model marks resets slightly negative, since they move the disc away from the end zone, so reset handlers sit lower than their value to the offence.</p>
 {ec_svg}
-<h3>Completion probability over expected</h3>
-<p class="muted">A player's completion rate minus the rate a typical teammate would have had on the same throws, in percentage points. For each throw the model gives a completion chance from its length, direction and start position, without knowing who threw it. Summing those gives the expected completions, in grey next to the actual count. The average of those chances is the player's xCP: high means safe throw selection, low means ambitious. So 32/32 with an xCP of 93% is +7 points, and 234/259 with an xCP of 89% is about +2. On few throws this swings wildly, so read it with the throw count. "pts" means percentage points, the plain difference between the two completion rates (100% minus 93% is 7 points), rather than a relative change.</p>
-{cpoe_svg}
 {roses}""")
 
     # -- receiving
@@ -935,8 +947,8 @@ def build(p, g, passes, by_game) -> str:
 <p><b>How the data was recorded.</b> Stats tagged in Statto by rewatching the game videos, so they are more complete than live stats but still hand-counted, and small errors are possible. Throw and catch gains are Statto's own distance estimates from the tapped field positions.</p>
 <p><b>Box-score stats.</b> Goals, assists, hockey assists (A2, the pass before the assist), blocks, throwaways, drops, holds and breaks follow the usual ultimate definitions, the same as in Statto, Ultiworld and UltiAnalytics. Turnovers in the stat sheet are throwaways plus drops, which is Statto's per-player count. It is higher than the team's turnover count because Statto sometimes tags one turnover as both a throwaway and a drop, when thrower and receiver share the blame. +/- is goals + assists + blocks − turnovers{a2_note()}, a common convention rather than a rule. A clean hold is an O point scored on our first possession. Which points started on offence is reconstructed from the lineups in the per-game player stats and matches Statto's hold and break counts in every game.</p>
 <p><b>Throw categories.</b> Swing and dump are Statto's flags. From this data they work out as: dump is any pass that goes backwards, swing moves the disc at least 11 m across the field within about 8 m forward or back. Long (20 m or more forward) is our own threshold, chosen because the completion rate drops sharply there.</p>
-<p><b>Completions over expected (Throwing section).</b> Each throw is compared with the team completion rate for throws in the same forward-distance bin, and the differences are summed. A standard observed-minus-expected construction. If a player were exactly average, the standard deviation of that sum over n throws is about √(n·p·(1−p)), roughly 3.5 at 130 throws, so single-goal differences are noise.</p>
-<p><b>Expected contribution section.</b> Concepts borrowed from <a href="https://shownspace.com/">Shown Space</a>, the analytics project built on UFA data (see their <a href="https://shownspace.substack.com/p/welcome-to-shown-space-your-field">introduction</a> and the <a href="https://www.watchufa.com/league/news/2026-ufa-shown-space-stats-analytics-introduction">UFA article</a>): aEC accumulates the change in the team's expected scoring probability over a player's actions, xCP is a throw's expected completion probability from distance, angle and field position, CPOE is completion rate against that expectation, and tendency radials show throw directions. The models on this page are not theirs. They are two small ridge logistic regressions fitted on this event's own {passes.attrs.get("models", {}).get("possessions", 0) if len(passes) else 0} possessions: scoring chance from distance to the end zone (linear and squared) and distance from the centre line, and completion chance from throw length, forward gain, lateral movement and start position. A completed pass is credited with the change in scoring chance, split {THROWER_SHARE:.0%} thrower and {1 - THROWER_SHARE:.0%} receiver, and a turnover costs the scoring chance the possession had, split when both players were blamed. The opponent's value after a turnover is left out, since there are no defensive events in the log to balance it, so the team's total is about zero by construction. CPOE here is in percentage points (written pts), the actual completion rate minus the expected one, so 100% against an expected 93% is +7 pts. It is a plain difference of two rates, not a relative increase. The completion count and expected completions are shown alongside. The "over expected" idea itself comes from football analytics, where <a href="https://www.nfeloapp.com/analysis/over-expected-explained-what-are-cpoe-ryoe-and-yacoe/">this explainer</a> makes the fair point that such numbers are model errors and inherit the model's blind spots. Full formulas are in the docstring of <code>fit_models</code> in the build script.</p>
+<p><b>CPOE (Throwing section).</b> A standard observed-minus-expected construction: each throw's expected completion probability (xCP) comes from a model fitted on this event's pass logs. It is shown per throw, as the player's actual completion rate minus the expected one in percentage points (written pts, a plain difference of two rates, not a relative increase, so 100% against an expected 93% is +7 pts), and as a count, completions minus expected completions, which for the same player is +2.1 over 32 throws. If a player were exactly average, the standard deviation of their completion count over n throws is about √(n·p·(1−p)), roughly 3.5 completions at 130 throws, or 2.7 pts, so small differences are noise.</p>
+<p><b>Expected contribution section.</b> Concepts borrowed from <a href="https://shownspace.com/">Shown Space</a>, the analytics project built on UFA data (see their <a href="https://shownspace.substack.com/p/welcome-to-shown-space-your-field">introduction</a> and the <a href="https://www.watchufa.com/league/news/2026-ufa-shown-space-stats-analytics-introduction">UFA article</a>): aEC accumulates the change in the team's expected scoring probability over a player's actions, xCP is a throw's expected completion probability from distance, angle and field position, CPOE is completion rate against that expectation, and tendency radials show throw directions. The models on this page are not theirs. They are two small ridge logistic regressions fitted on this event's own {passes.attrs.get("models", {}).get("possessions", 0) if len(passes) else 0} possessions: scoring chance from distance to the end zone (linear and squared) and distance from the centre line, and completion chance from throw length, forward gain, lateral movement and start position. A completed pass is credited with the change in scoring chance, split {THROWER_SHARE:.0%} thrower and {1 - THROWER_SHARE:.0%} receiver, and a turnover costs the scoring chance the possession had, split when both players were blamed. The opponent's value after a turnover is left out, since there are no defensive events in the log to balance it, so the team's total is about zero by construction. The "over expected" idea itself comes from football analytics, where <a href="https://www.nfeloapp.com/analysis/over-expected-explained-what-are-cpoe-ryoe-and-yacoe/">this explainer</a> makes the fair point that such numbers are model errors and inherit the model's blind spots. Full formulas are in the docstring of <code>fit_models</code> in the build script.</p>
 </footer>
 </main>
 <script>{JS}</script>
