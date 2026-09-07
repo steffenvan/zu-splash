@@ -62,6 +62,11 @@ ROSE_SECTORS = 12     # direction sectors in the tendency radials
 # ADAPT: order of the sections on the page
 SECTION_ORDER = ["games", "sheet", "playing", "throwing", "connections", "receiving", "scoring", "points_won", "models"]
 
+# ADAPT: opponent seeds at the event, keyed by opponent. Used as a proxy for opponent strength.
+SEEDS = {"BFD Redshot": 12, "Hammers Bs As": 28, "Rebel": 44, "Avalon": 38, "Shame": 7, "Meclao": 9,
+         "Tiefseetaucher": 8, "Union": 17, "Tartu Turbulence": 13, "Monkey Grenoble": 36}
+OWN_SEED = 21
+
 # ADAPT: actual schedule, keyed by opponent as named in the Games export. Overrides the
 # dates and times Statto recorded (which are when the game was tagged, not played) and
 # fixes the order of the tabs and score strip. Stage is shown under each score.
@@ -73,8 +78,8 @@ SCHEDULE = {
     "Shame":            ("2026-08-18", "13:00", "Pool G"),
     "Meclao":           ("2026-08-19", "09:00", "Playoff 1–32"),
     "Tiefseetaucher":   ("2026-08-19", "15:30", "Playoff 1–32, round 2"),
-    "Union":            ("2026-08-20", "09:00", "Quarterfinal"),
-    "Tartu Turbulence": ("2026-08-20", "15:00", "Semifinal"),
+    "Union":            ("2026-08-20", "09:00", "Quarterfinal, for top 16"),
+    "Tartu Turbulence": ("2026-08-20", "15:00", "Semifinal, for top 10"),
     "Monkey Grenoble":  ("2026-08-21", "09:00", "Final"),
 }
 
@@ -625,7 +630,51 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
         per_m["tot"] = per_m.sum(axis=1)
         per_m = per_m.sort_values("tot", ascending=False)
         split_svg = stacked_bars([(t, [r_.MMP, r_.FMP]) for t, r_ in per_m.iterrows()])
+        rec_m = mm[mm["completed"] == 1].groupby(["r", "tm"]).size().unstack(fill_value=0).reindex(columns=["MMP", "FMP"], fill_value=0)
+        rec_m["tot"] = rec_m.sum(axis=1)
+        rec_m = rec_m.sort_values("tot", ascending=False)
+        recv_svg = stacked_bars([(t, [r_.MMP, r_.FMP]) for t, r_ in rec_m.iterrows()])
         unmapped_note = (f' Not in the MMP/FMP list, so left out here: {", ".join(nm(x) for x in unmapped)}.' if unmapped else "")
+
+        # context: by opponent and by score state (all-games view only)
+        context_html = ""
+        if not single_game and mm["game"].nunique() > 1:
+            rows_ = []
+            for gm, dg in mm.groupby("game"):
+                us = them = 0
+                for pt in sorted(dg["Point"].unique()):
+                    rows_.append((gm, pt, us - them))
+                    if dg.loc[dg["Point"] == pt, "assist"].max() == 1:
+                        us += 1
+                    else:
+                        them += 1
+            sc = pd.DataFrame(rows_, columns=["game", "Point", "margin"])
+            mx = mm.merge(sc, on=["game", "Point"])
+            mx["to_fmp"] = (mx["rm"] == "FMP").astype(int)
+            mx["from_fmp"] = (mx["tm"] == "FMP").astype(int)
+            by_game = mx.groupby("game").agg(n=("to_fmp", "size"), to_fmp=("to_fmp", "mean"), from_fmp=("from_fmp", "mean"))
+            gi = g.set_index("Opponent")
+            by_game["seed"] = by_game.index.map(SEEDS)
+            by_game["score"] = by_game.index.map(lambda o: f"{gi.loc[o, 'us']}–{gi.loc[o, 'them']}")
+            by_game = by_game.loc[[o for o in g["Opponent"] if o in by_game.index]]
+            og_rows = "".join(f"<tr><td>{esc(o)}<span class=\"stage\">{esc(gi.loc[o, 'stage'])}</span></td><td>{'' if pd.isna(r_.seed) else int(r_.seed)}</td><td>{r_.score}</td>"
+                              f"<td>{int(r_.n)}</td><td>{r_.to_fmp:.0%}</td><td>{r_.from_fmp:.0%}</td></tr>" for o, r_ in by_game.iterrows())
+            by_opp_table = ('<div class="scroll"><table class="games"><thead><tr><th>Opponent</th><th>Seed</th><th>Score</th><th>Throws</th><th>To FMP</th><th>From FMP</th></tr></thead>'
+                            f'<tbody>{og_rows}</tbody></table></div>')
+            mx["state"] = pd.cut(mx["margin"], [-99, -3, -1, 1, 3, 99],
+                                 labels=["Trailing by 3 or more", "Trailing by 1 or 2", "Tied or within 1", "Leading by 1 or 2", "Leading by 3 or more"])
+            by_state = mx.groupby("state", observed=True).agg(n=("to_fmp", "size"), to_fmp=("to_fmp", "mean"), from_fmp=("from_fmp", "mean"))
+            st_rows = "".join(f"<tr><td>{st}</td><td>{int(r_.n)}</td><td>{r_.to_fmp:.0%}</td><td>{r_.from_fmp:.0%}</td></tr>" for st, r_ in by_state.iterrows())
+            by_state_table = ('<table><thead><tr><th>Score before the point</th><th>Throws</th><th>To FMP</th><th>From FMP</th></tr></thead>'
+                              f'<tbody>{st_rows}</tbody></table>')
+            corr_seed = by_game[["seed", "to_fmp"]].dropna().corr().iloc[0, 1] if by_game["seed"].notna().sum() > 2 else float("nan")
+            context_html = f"""
+<h3>Does it change with the opponent or the score?</h3>
+<p class="muted">Share of throws to and from FMPs, by game with the opponent's seed (we were seeded {OWN_SEED}), and by the score at the start of the point. The share to and from MMPs is the rest, so 42% to FMP means 58% to MMP. With a few hundred throws per row the sampling noise is around 3 points, so only differences well beyond that mean anything.</p>
+{by_opp_table}
+<p class="muted">Across games the share to FMPs correlates with opponent seed ({corr_seed:+.2f}), but the relation is carried by the two games with a placement on the line, the quarterfinal for top 16 and the semifinal for top 10, which are the two lowest rows. Opponent strength on its own does not explain it: the three losses to top-9 seeds, including the pool game against Shame, sit at the same share as the comfortable pool wins.</p>
+{by_state_table}
+<p class="muted">Within games there is no consistent shift with the score. The share moves up and down between score states in no particular order, which is what noise looks like.</p>"""
 
         kinds = ["long", "upfield", "swing", "dump"]
         tk = pl.groupby("kind").agg(n=("completed", "size"), comp=("completed", "sum"), fwd=("fwd", "mean")).reindex(kinds)
@@ -662,11 +711,16 @@ def build_view(p: pd.DataFrame, g: pd.DataFrame, passes: pd.DataFrame, *, single
 <h3>Favourite targets</h3>
 <p class="muted">Each player's top {TOP_TARGETS} receivers and top {TOP_TARGETS} throwers, by attempts.</p>
 {fav_table}
-<h3>MMP and FMP throwing</h3>
+<h3>MMP and FMP</h3>
 <p class="muted">Where the disc goes between matching groups. Share is the fraction of all logged throws. Forward metres are shown twice: averaged over every attempt, which measures how ambitious the throws were, and over completions only, which is the ground actually gained. Turnovers are on average much longer throws than completions, so the two differ.{unmapped_note}</p>
 {combo_table}
+<h3>Throwing: who each player throws to</h3>
 <p class="legend">Throws per player, most first<i style="background:{SPLASH}"></i>to MMP<i style="background:{AMBER}"></i>to FMP</p>
 {split_svg}
+<h3>Receiving: who each player catches from</h3>
+<p class="legend">Completed catches per player, most first<i style="background:{SPLASH}"></i>from MMP<i style="background:{AMBER}"></i>from FMP</p>
+{recv_svg}
+{context_html}
 <h3>Completion by throw type</h3>
 <p class="muted">Categories from the tapped positions. Dump is any pass that goes backwards, however far sideways. Swing is a pass that moves the disc at least 11 m across the field while staying within about 8 m forward or back. Long is any throw gaining {LONG_THROW_M} m or more. Upfield is everything else, from a short give-and-go up to just under {LONG_THROW_M} m. Splitting throws this way makes throwers comparable, since a dump and a long throw are different jobs. Forward metres are positive when the disc moves toward the end zone we are attacking, shown once averaged over every attempt and once over completions only.</p>
 {team_kind_table}
